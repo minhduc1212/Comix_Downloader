@@ -1,0 +1,6 @@
+.venv
+__pycache__
+*.json
+*.log
+pvry-one-piece
+test
