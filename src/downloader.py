@@ -279,13 +279,10 @@ def download_chapter(page, chapter_url, save_dir, progress_callback=None):
 
     page.on("response", handle_response)
     
-    # Abort unnecessary resources (stylesheets, fonts, media) and trackers to load faster
+    # Abort trackers/analytics to load faster
     def route_filter(route):
-        resource_type = route.request.resource_type
         url = route.request.url
-        if resource_type in ["stylesheet", "font", "media"]:
-            route.abort()
-        elif any(tracker in url for tracker in ["google-analytics", "doubleclick", "facebook", "analytics", "ads"]):
+        if any(tracker in url for tracker in ["google-analytics", "doubleclick", "facebook", "analytics", "ads", "whos.amung.us"]):
             route.abort()
         else:
             route.continue_()

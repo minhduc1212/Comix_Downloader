@@ -40,6 +40,8 @@ custom tkinter
             progress bar to know all the progeress image ?/? chapter ?/?
             choose the group to download -> the chapter below only show the group
             show what chapter done
+            get info will get all chapter_title, chapter_url and group first -> save to a file
+            add the queue of the download chapter -> change the status to know this chapter in queue
 
 # fix
-    Error downloading https://j24n.wowpic1.store/i4/bEqPbYfoMT0Gm03lbmafoBJcyrkdVvw/11.webp: ('Connection broken: IncompleteRead(430724 bytes read, 115324 more expected)', IncompleteRead(430724 bytes read, 115324 more expected)) -> not done -> wait more for loading -> just end if the status is 404 -> the other status should be wait and retry at least 3 times
+    Error downloading https://j24n.wowpic1.store/i4/bEqPbYfoMT0Gm03lbmafoBJcyrkdVvw/11.webp: ('Connection broken: IncompleteRead(430724 bytes read, 115324 more expected)', IncompleteRead(430724 bytes read, 115324 more expected)) -> not done -> wait more for loading -> just end if the status is 404 -> the other status should be wait and retry at least 3 times    

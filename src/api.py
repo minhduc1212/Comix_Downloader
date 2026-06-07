@@ -14,9 +14,9 @@ def get_metadata_app(url):
             def route_filter(route):
                 resource_type = route.request.resource_type
                 url_str = route.request.url
-                if resource_type in ["stylesheet", "font", "media", "image"]:
+                if resource_type in ["media", "image"]:
                     route.abort()
-                elif any(tracker in url_str for tracker in ["google-analytics", "doubleclick", "facebook", "analytics", "ads"]):
+                elif any(tracker in url_str for tracker in ["google-analytics", "doubleclick", "facebook", "analytics", "ads", "whos.amung.us"]):
                     route.abort()
                 else:
                     route.continue_()
@@ -68,9 +68,9 @@ def get_chapters_page(base_url, page_num):
             def route_filter(route):
                 resource_type = route.request.resource_type
                 url_str = route.request.url
-                if resource_type in ["stylesheet", "font", "media", "image"]:
+                if resource_type in ["media", "image"]:
                     route.abort()
-                elif any(tracker in url_str for tracker in ["google-analytics", "doubleclick", "facebook", "analytics", "ads"]):
+                elif any(tracker in url_str for tracker in ["google-analytics", "doubleclick", "facebook", "analytics", "ads", "whos.amung.us"]):
                     route.abort()
                 else:
                     route.continue_()

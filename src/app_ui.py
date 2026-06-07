@@ -10,6 +10,9 @@ from .downloader import download_chapter, sanitize_filename
 import queue
 import re
 import os
+import json
+import logging
+
 
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
@@ -81,14 +84,11 @@ class App(ctk.CTk):
         self.change_path_btn = ctk.CTkButton(self.controls_frame, text="Change Path", command=self.change_save_path, width=120)
         self.change_path_btn.grid(row=0, column=1, padx=10, pady=(10, 5), sticky="e")
 
-        self.download_all_page_btn = ctk.CTkButton(self.controls_frame, text="Download All on Page", command=self.download_all_on_page)
-        self.download_all_page_btn.grid(row=1, column=0, padx=10, pady=(5, 10), sticky="ew")
-
         self.group_combo = ctk.CTkOptionMenu(self.controls_frame, values=self.group_options, command=self.on_group_changed)
-        self.group_combo.grid(row=1, column=1, padx=10, pady=(5, 10), sticky="ew")
+        self.group_combo.grid(row=1, column=0, padx=10, pady=(5, 10), sticky="ew")
 
         self.download_all_btn = ctk.CTkButton(self.controls_frame, text="Download Whole Manga", command=self.download_whole_manga)
-        self.download_all_btn.grid(row=1, column=2, padx=10, pady=(5, 10), sticky="ew")
+        self.download_all_btn.grid(row=1, column=1, padx=10, pady=(5, 10), sticky="ew")
 
         # 4. Right Frame: Chapters list
         self.chapters_frame = ctk.CTkScrollableFrame(self, label_text="Chapters")
@@ -133,6 +133,10 @@ class App(ctk.CTk):
             
         self.current_url = url
         self.current_page = 1
+        self.all_chapters = []
+        self.group_options = ["All Groups"]
+        self.group_combo.configure(values=self.group_options)
+        self.group_combo.set("All Groups")
         
         # Reset UI
         self.title_label.configure(text="Loading...")
@@ -142,16 +146,187 @@ class App(ctk.CTk):
         self.desc_textbox.configure(state="disabled")
         self.get_btn.configure(state="disabled")
         
-        threading.Thread(target=self.fetch_metadata_thread, args=(url,), daemon=True).start()
-        self.load_chapters()
+        for widget in self.chapters_frame.winfo_children():
+            widget.destroy()
+        loading_label = ctk.CTkLabel(self.chapters_frame, text="Loading info and chapters...")
+        loading_label.grid(row=0, column=0, pady=20)
+        
+        self.prev_btn.configure(state="disabled")
+        self.next_btn.configure(state="disabled")
+        
+        # Start background thread to load all info and chapters
+        threading.Thread(target=self.fetch_info_thread, args=(url,), daemon=True).start()
 
-    def fetch_metadata_thread(self, url):
+    def fetch_info_thread(self, url):
+        # 1. Fetch metadata first to show on the UI
         metadata = get_metadata_app(url)
         self.after(0, self.update_metadata_ui, metadata)
+        
+        if "error" in metadata:
+            self.after(0, lambda: self.get_btn.configure(state="normal"))
+            self.after(0, self.clear_loading_label)
+            return
+            
+        # 2. Extract slug for progress file
+        match = re.search(r'/title/([^/]+)', url)
+        slug = match.group(1) if match else "unknown"
+        progress_file = f"progress_{slug}.json"
+        
+        # 3. Load existing chapters if file exists
+        local_chapters = []
+        if os.path.exists(progress_file):
+            try:
+                with open(progress_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    local_chapters = data.get("chapters", [])
+                logging.info(f"Loaded {len(local_chapters)} chapters from local file.")
+                # Show the loaded chapters instantly on the UI!
+                self.after(0, self.display_local_chapters, local_chapters)
+            except Exception as e:
+                logging.error(f"Error loading local progress file: {e}")
+                
+        # 4. Crawl the website to check for new chapters / fetch all chapters
+        self.after(0, lambda: self.status_label.configure(text="Checking for new chapters..."))
+        
+        from playwright.sync_api import sync_playwright
+        from .utils import get_random_user_agent, random_delay
+        
+        all_chapters = list(local_chapters)
+        existing_urls = {c["chapter_url"] for c in all_chapters}
+        
+        new_chapters = []
+        page_num = 1
+        banned = False
+        
+        with sync_playwright() as p:
+            try:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page(user_agent=get_random_user_agent())
+                
+                # Route filter to block trackers and images to make it super fast
+                def route_filter(route):
+                    resource_type = route.request.resource_type
+                    url_str = route.request.url
+                    if resource_type in ["media", "image"]:
+                        route.abort()
+                    elif any(tracker in url_str for tracker in ["google-analytics", "doubleclick", "facebook", "analytics", "ads", "whos.amung.us"]):
+                        route.abort()
+                    else:
+                        route.continue_()
+                try:
+                    page.route("**/*", route_filter)
+                except Exception:
+                    pass
+                    
+                while True:
+                    separator = "&" if "?" in url else "?"
+                    page_url = f"{url}{separator}page={page_num}"
+                    self.after(0, lambda p=page_num: self.status_label.configure(text=f"Fetching chapters: Page {p}..."))
+                    
+                    try:
+                        random_delay(0.5, 1.5)
+                        page.goto(page_url, wait_until="domcontentloaded", timeout=15000)
+                        if "Just a moment" in page.title() or "Cloudflare" in page.title():
+                            banned = True
+                            break
+                        page.wait_for_selector('.mchap-item', timeout=5000)
+                    except Exception:
+                        # Timeout or no chapters on this page -> we reached the end of the pages
+                        break
+                        
+                    # Parse chapters on this page
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(page.content(), 'html.parser')
+                    items = soup.find_all('li', class_='mchap-item')
+                    if not items:
+                        break
+                        
+                    page_results = []
+                    for item in items:
+                        a_tag = item.find('a', class_='mchap-row__primary')
+                        if not a_tag:
+                            continue
+                            
+                        chapter_url = "https://comix.to" + a_tag.get('href', '')
+                        
+                        ch_span = a_tag.find('span', class_='mchap-row__ch')
+                        title_span = a_tag.find('span', class_='mchap-row__title')
+                        
+                        chapter_name = ""
+                        if ch_span:
+                            chapter_name += ch_span.get_text(strip=True)
+                        if title_span:
+                            if chapter_name:
+                                chapter_name += " - "
+                            chapter_name += title_span.get_text(strip=True)
+                            
+                        group_tag = item.find('a', class_='mchap-row__group')
+                        group = ""
+                        if group_tag:
+                            group_span = group_tag.find('span')
+                            if group_span:
+                                group = group_span.get_text(strip=True)
+                                
+                        page_results.append({
+                            "chapter_name": chapter_name,
+                            "chapter_url": chapter_url,
+                            "group": group
+                        })
+                    
+                    # Check if we have seen these chapters
+                    any_new_in_page = False
+                    for r in page_results:
+                        if r["chapter_url"] not in existing_urls:
+                            new_chapters.append(r)
+                            existing_urls.add(r["chapter_url"])
+                            any_new_in_page = True
+                            
+                    # If this page contains NO new chapters and we already have some chapters,
+                    # we can stop crawling immediately because we have reached the previously crawled chapters!
+                    if not any_new_in_page and len(local_chapters) > 0:
+                        logging.info("Found no new chapters on this page, stopping crawl.")
+                        break
+                        
+                    page_num += 1
+                    
+                browser.close()
+            except Exception as e:
+                logging.error(f"Error in chapter crawling thread: {e}")
+                
+        self.after(0, lambda: self.get_btn.configure(state="normal"))
+        self.after(0, lambda: self.status_label.configure(text="Idle"))
+        
+        if banned:
+            self.after(0, lambda: messagebox.showerror("Access Denied", "Cloudflare Challenge or IP Ban detected while fetching chapters.\nPlease wait a few minutes or use a VPN."))
+            return
+            
+        # Prepend new chapters to the beginning of the list (since they are newest)
+        if new_chapters:
+            all_chapters = new_chapters + local_chapters
+            # Save to progress file
+            try:
+                with open(progress_file, 'w', encoding='utf-8') as f:
+                    json.dump({"next_page": page_num, "chapters": all_chapters}, f, indent=4)
+                logging.info(f"Progress saved to {progress_file}. Total chapters: {len(all_chapters)}")
+            except Exception as e:
+                logging.error(f"Failed to save progress to {progress_file}: {e}")
+        else:
+            all_chapters = local_chapters
+            # In case it is a new crawl and there was no local progress file
+            if not os.path.exists(progress_file) and all_chapters:
+                try:
+                    with open(progress_file, 'w', encoding='utf-8') as f:
+                        json.dump({"next_page": page_num, "chapters": all_chapters}, f, indent=4)
+                except Exception as e:
+                    logging.error(f"Failed to save progress: {e}")
+                
+        self.after(0, self.display_local_chapters, all_chapters)
+
+    def clear_loading_label(self):
+        for widget in self.chapters_frame.winfo_children():
+            widget.destroy()
 
     def update_metadata_ui(self, metadata):
-        self.get_btn.configure(state="normal")
-        
         if "error" in metadata:
             if metadata["error"] == "BANNED":
                 messagebox.showerror("Access Denied", "Cloudflare Challenge or IP Ban detected from the website.\n\nPlease wait a few minutes, clear your IP limit, or try using a VPN.")
@@ -184,76 +359,66 @@ class App(ctk.CTk):
         except Exception as e:
             print(f"Error loading image: {e}")
 
-    def load_chapters(self):
-        for widget in self.chapters_frame.winfo_children():
-            widget.destroy()
-            
-        loading_label = ctk.CTkLabel(self.chapters_frame, text="Loading chapters...")
-        loading_label.grid(row=0, column=0, pady=20)
+    def display_local_chapters(self, all_chapters):
+        self.all_chapters = all_chapters
         
-        self.prev_btn.configure(state="disabled")
-        self.next_btn.configure(state="disabled")
-        
-        threading.Thread(target=self.fetch_chapters_thread, args=(self.current_url, self.current_page), daemon=True).start()
-        
-    def fetch_chapters_thread(self, url, page_num):
-        chapters = get_chapters_page(url, page_num)
-        self.after(0, self.update_chapters_ui, chapters)
-        
-    def update_chapters_ui(self, chapters):
-        self.chapters_data = chapters
-        
-        for widget in self.chapters_frame.winfo_children():
-            widget.destroy()
+        # Update scanlation group options in the combo menu
+        new_groups_found = False
+        for chap in all_chapters:
+            g = chap.get("group", "")
+            if g and g not in self.group_options:
+                self.group_options.append(g)
+                new_groups_found = True
+                
+        if new_groups_found:
+            self.group_combo.configure(values=self.group_options)
             
-        if chapters and len(chapters) == 1 and chapters[0].get("error") == "BANNED":
-            messagebox.showerror("Access Denied", "Cloudflare Challenge or IP Ban detected while fetching chapters.\nPlease wait a few minutes or use a VPN.")
-            self.page_label.configure(text="Error")
-            return
-            
-        self.page_label.configure(text=f"Page {self.current_page}")
-        
-        if self.current_page > 1:
-            self.prev_btn.configure(state="normal")
-        else:
-            self.prev_btn.configure(state="disabled")
-            
-        if chapters:
-            self.next_btn.configure(state="normal")
-            
-            new_groups_found = False
-            for chap in chapters:
-                g = chap.get("group", "")
-                if g and g not in self.group_options:
-                    self.group_options.append(g)
-                    new_groups_found = True
-                    
-            if new_groups_found:
-                self.group_combo.configure(values=self.group_options)
-            
-            self.render_chapters_list()
-        else:
-            self.next_btn.configure(state="disabled")
-            lbl = ctk.CTkLabel(self.chapters_frame, text="No chapters found on this page.")
-            lbl.grid(row=0, column=0, pady=20)
+        self.render_chapters_page()
 
     def on_group_changed(self, choice):
-        self.render_chapters_list()
+        self.current_page = 1
+        self.render_chapters_page()
 
-    def render_chapters_list(self):
+    def render_chapters_page(self):
         for widget in self.chapters_frame.winfo_children():
             widget.destroy()
             
         selected_group = self.group_combo.get()
-        displayed_count = 0
+        
+        # Filter chapters by group
+        filtered_chapters = self.all_chapters
+        if selected_group != "All Groups":
+            filtered_chapters = [c for c in self.all_chapters if c.get("group", "") == selected_group]
+            
+        page_size = 20
+        total_filtered = len(filtered_chapters)
+        total_pages = max(1, (total_filtered + page_size - 1) // page_size)
+        
+        # Clamp current_page
+        if self.current_page > total_pages:
+            self.current_page = total_pages
+        if self.current_page < 1:
+            self.current_page = 1
+            
+        self.page_label.configure(text=f"Page {self.current_page} of {total_pages}")
+        
+        # Enable/disable pagination buttons
+        self.prev_btn.configure(state="normal" if self.current_page > 1 else "disabled")
+        self.next_btn.configure(state="normal" if self.current_page < total_pages else "disabled")
+        
+        # Slice for the current page
+        start_idx = (self.current_page - 1) * page_size
+        end_idx = min(start_idx + page_size, total_filtered)
+        page_chapters = filtered_chapters[start_idx:end_idx]
         
         self.chapter_buttons = getattr(self, "chapter_buttons", {})
         
-        for i, chap in enumerate(self.chapters_data):
-            if selected_group != "All Groups" and chap.get("group", "") != selected_group:
-                continue
-                
-            displayed_count += 1
+        if not page_chapters:
+            lbl = ctk.CTkLabel(self.chapters_frame, text="No chapters found.")
+            lbl.grid(row=0, column=0, pady=20)
+            return
+            
+        for i, chap in enumerate(page_chapters):
             frame = ctk.CTkFrame(self.chapters_frame)
             frame.grid(row=i, column=0, padx=5, pady=5, sticky="ew")
             frame.grid_columnconfigure(0, weight=1)
@@ -265,28 +430,37 @@ class App(ctk.CTk):
             lbl = ctk.CTkLabel(frame, text=name_text, anchor="w")
             lbl.grid(row=0, column=0, padx=10, pady=5, sticky="w")
             
-            btn = ctk.CTkButton(frame, text="Download", width=80, 
+            # Check complete status from disk
+            match = re.search(r'/title/([^/]+)', self.current_url)
+            slug = match.group(1) if match else "unknown"
+            base_dir = os.path.join(self.save_path, slug)
+            
+            ch_name_safe = sanitize_filename(chap.get("chapter_name", "Unknown"))
+            group_safe = sanitize_filename(chap.get("group", ""))
+            folder_name = ch_name_safe
+            if group_safe:
+                folder_name += f" [{group_safe}]"
+            save_dir = os.path.join(base_dir, folder_name)
+            
+            is_done = os.path.exists(os.path.join(save_dir, ".complete"))
+            
+            btn_text = "Done" if is_done else "Download"
+            btn_state = "disabled" if is_done else "normal"
+            
+            btn = ctk.CTkButton(frame, text=btn_text, width=80, state=btn_state,
                                 command=lambda c=chap: self.download_chapter(c))
             btn.grid(row=0, column=1, padx=10, pady=5)
             
-            # Store button ref to change text to "Done" later
             self.chapter_buttons[chap.get("chapter_url")] = btn
-            
-            if chap.get("downloaded", False):
-                btn.configure(text="Done", state="disabled")
-                
-        if displayed_count == 0 and self.chapters_data:
-            lbl = ctk.CTkLabel(self.chapters_frame, text="No chapters match the selected group.")
-            lbl.grid(row=0, column=0, pady=20)
 
     def prev_page(self):
         if self.current_page > 1:
             self.current_page -= 1
-            self.load_chapters()
+            self.render_chapters_page()
 
     def next_page(self):
         self.current_page += 1
-        self.load_chapters()
+        self.render_chapters_page()
 
     def start_worker_if_needed(self):
         with self.worker_lock:
@@ -398,39 +572,14 @@ class App(ctk.CTk):
         self.download_queue.put(chap)
         self.start_worker_if_needed()
 
-    def download_all_on_page(self):
-        selected_group = self.group_combo.get()
-        for chap in self.chapters_data:
-            if chap.get("error") == "BANNED":
-                continue
-            if selected_group != "All Groups" and chap.get("group", "") != selected_group:
-                continue
-            self.download_chapter(chap)
 
     def download_whole_manga(self):
         selected_group = self.group_combo.get()
-        threading.Thread(target=self.download_whole_manga_thread, args=(selected_group,), daemon=True).start()
-
-    def download_whole_manga_thread(self, selected_group):
-        url = self.current_url
-        if not url:
-            return
-            
-        page_num = 1
-        self.after(0, lambda: self.status_label.configure(text="Fetching chapter list..."))
-        while True:
-            chapters = get_chapters_page(url, page_num)
-            if not chapters:
-                break
-            if len(chapters) == 1 and chapters[0].get("error") == "BANNED":
-                print("Banned while paginating chapters.")
-                self.after(0, lambda: messagebox.showerror("Access Denied", "Cloudflare Challenge or IP Ban detected.\nDownload stopped."))
-                break
-            for chap in chapters:
-                if selected_group != "All Groups" and chap.get("group", "") != selected_group:
-                    continue
-                self.download_queue.put(chap)
-            page_num += 1
-            
-        self.start_worker_if_needed()
-        print("Finished scheduling whole manga download")
+        count = 0
+        for chap in self.all_chapters:
+            if selected_group != "All Groups" and chap.get("group", "") != selected_group:
+                continue
+            self.download_chapter(chap)
+            count += 1
+        if count > 0:
+            messagebox.showinfo("Info", f"Queued {count} chapters for download.")
