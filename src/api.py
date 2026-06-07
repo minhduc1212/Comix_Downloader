@@ -1,6 +1,7 @@
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 from .utils import get_random_user_agent, random_delay
+import re
 
 def get_metadata_app(url):
     try:
@@ -8,7 +9,23 @@ def get_metadata_app(url):
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page(user_agent=get_random_user_agent())
-            page.goto(url, wait_until="networkidle")
+            
+            # Route filter to block heavy resources/trackers
+            def route_filter(route):
+                resource_type = route.request.resource_type
+                url_str = route.request.url
+                if resource_type in ["stylesheet", "font", "media", "image"]:
+                    route.abort()
+                elif any(tracker in url_str for tracker in ["google-analytics", "doubleclick", "facebook", "analytics", "ads"]):
+                    route.abort()
+                else:
+                    route.continue_()
+            try:
+                page.route("**/*", route_filter)
+            except Exception:
+                pass
+                
+            page.goto(url, wait_until="domcontentloaded", timeout=15000)
             
             if "Just a moment" in page.title() or "Cloudflare" in page.title():
                 browser.close()
@@ -46,8 +63,24 @@ def get_chapters_page(base_url, page_num):
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page(user_agent=get_random_user_agent())
+            
+            # Route filter to block heavy resources/trackers
+            def route_filter(route):
+                resource_type = route.request.resource_type
+                url_str = route.request.url
+                if resource_type in ["stylesheet", "font", "media", "image"]:
+                    route.abort()
+                elif any(tracker in url_str for tracker in ["google-analytics", "doubleclick", "facebook", "analytics", "ads"]):
+                    route.abort()
+                else:
+                    route.continue_()
             try:
-                page.goto(url, wait_until='networkidle')
+                page.route("**/*", route_filter)
+            except Exception:
+                pass
+                
+            try:
+                page.goto(url, wait_until='domcontentloaded', timeout=15000)
                 if "Just a moment" in page.title() or "Cloudflare" in page.title():
                     browser.close()
                     return [{"error": "BANNED"}]

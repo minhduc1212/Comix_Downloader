@@ -3,6 +3,9 @@ import re
 import json
 import logging
 import requests
+import concurrent.futures
+import threading
+import time
 from playwright.sync_api import sync_playwright
 from .utils import get_random_user_agent, random_delay
 
@@ -20,7 +23,7 @@ def sanitize_filename(name):
     # Remove invalid characters for Windows/Linux folder names
     return re.sub(r'[<>:"/\\|?*]', '', name).strip()
 
-def download_sequential_images(first_image_url, save_dir, progress_callback=None):
+def download_sequential_images(first_image_url, save_dir, progress_callback=None, max_workers=5):
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
         
@@ -37,84 +40,218 @@ def download_sequential_images(first_image_url, save_dir, progress_callback=None
     
     num_length = len(num_str)
     
-    current_idx = 1
-    downloaded_any = False
+    # Consistent User-Agent for this chapter
+    user_agent = get_random_user_agent()
     
-    while True:
-        current_num_str = str(current_idx).zfill(num_length)
+    status = {}
+    status_lock = threading.Lock()
+    banned_flag = threading.Event()
+    
+    def download_page(idx):
+        if banned_flag.is_set():
+            return 'banned'
+            
+        current_num_str = str(idx).zfill(num_length)
         url = f"{base_url}{current_num_str}{ext}{query}"
-        
         file_path = os.path.join(save_dir, f"{current_num_str}{ext.split('?')[0]}")
         
         # Skip if we already downloaded this exact image
         if os.path.exists(file_path):
             logging.debug(f"File {file_path} already exists. Skipping.")
-            current_idx += 1
-            downloaded_any = True
-            continue
+            return 'downloaded'
             
-        logging.info(f"Downloading image {current_idx}: {url}")
+        logging.info(f"Downloading image {idx}: {url}")
         
+        temp_file_path = file_path + ".tmp"
         max_retries = 5
-        success_download = False
-        hit_404 = False
-        banned = False
-
         for attempt in range(max_retries):
-            # Random delay and random User-Agent before request
-            random_delay(0.5, 1.5)
+            if banned_flag.is_set():
+                return 'banned'
+                
+            # Random delay per request to avoid spikes
+            random_delay(0.3, 1.2)
+            
             headers = {
-                "User-Agent": get_random_user_agent(),
-                "Referer": "https://comix.to/"
+                "User-Agent": user_agent,
+                "Referer": "https://comix.to/",
+                "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Sec-Fetch-Dest": "image",
+                "Sec-Fetch-Mode": "no-cors",
+                "Sec-Fetch-Site": "cross-site",
+                "Connection": "close"
             }
             
-            try:
-                # Use stream=True and iter_content to handle IncompleteRead more gracefully
-                response = requests.get(url, headers=headers, timeout=30, stream=True)
-                if response.status_code == 404:
-                    logging.info(f"Encountered 404. Assuming chapter download is complete.")
-                    # Mark this chapter as completely downloaded
-                    with open(os.path.join(save_dir, ".complete"), "w") as f:
-                        f.write("done")
-                    hit_404 = True
-                    break
+            # Check if there is a partial download to resume
+            downloaded_bytes = 0
+            if os.path.exists(temp_file_path):
+                downloaded_bytes = os.path.getsize(temp_file_path)
                 
+            if downloaded_bytes > 0:
+                headers["Range"] = f"bytes={downloaded_bytes}-"
+                logging.info(f"Resuming download of image {idx} from byte {downloaded_bytes}...")
+            
+            try:
+                response = requests.get(url, headers=headers, timeout=30, stream=True)
+                
+                if response.status_code == 404:
+                    logging.info(f"Encountered 404 for image {idx}.")
+                    return '404'
+                    
+                if response.status_code == 416:
+                    logging.info(f"Encountered 416 (Range Not Satisfiable) for image {idx}. Assuming complete.")
+                    if os.path.exists(temp_file_path) and os.path.getsize(temp_file_path) > 0:
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                        os.rename(temp_file_path, file_path)
+                        if progress_callback:
+                            progress_callback(idx)
+                        return 'downloaded'
+                    else:
+                        if os.path.exists(temp_file_path):
+                            os.remove(temp_file_path)
+                        raise Exception("416 Range Not Satisfiable with empty or missing temp file")
+                        
                 if response.status_code in [403, 429]:
-                    logging.error(f"Encountered {response.status_code}. Likely banned or rate-limited.")
-                    banned = True
-                    break
+                    logging.error(f"Encountered {response.status_code} for image {idx}. Banned or rate-limited.")
+                    banned_flag.set()
+                    return 'banned'
                     
                 response.raise_for_status()
                 
-                # Write in chunks
-                with open(file_path, "wb") as f:
+                content_type = response.headers.get("Content-Type", "")
+                if "text/html" in content_type or "cloudflare" in content_type.lower():
+                    logging.error(f"Encountered HTML response instead of image for {url}. Likely Cloudflare challenge/ban.")
+                    banned_flag.set()
+                    return 'banned'
+                
+                is_partial = (response.status_code == 206)
+                write_mode = "ab" if is_partial else "wb"
+                
+                with open(temp_file_path, write_mode) as f:
                     for chunk in response.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
-                    
-                downloaded_any = True
-                success_download = True
+                
+                # Check if file is valid (non-empty)
+                if os.path.exists(temp_file_path) and os.path.getsize(temp_file_path) > 0:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    os.rename(temp_file_path, file_path)
+                else:
+                    if os.path.exists(temp_file_path):
+                        os.remove(temp_file_path)
+                    raise Exception("Downloaded file is empty")
+                
                 if progress_callback:
-                    progress_callback(current_idx)
-                break
+                    progress_callback(idx)
+                return 'downloaded'
+                
             except Exception as e:
                 logging.warning(f"Error downloading {url} (Attempt {attempt+1}/{max_retries}): {e}")
-                if attempt == max_retries - 1:
-                    logging.error(f"Failed to download {url} after {max_retries} attempts.")
+                if attempt < max_retries - 1:
+                    time.sleep(2 * (attempt + 1))  # Backoff
+                    
+        return 'failed'
+
+    active_futures = {}
+    next_submit_idx = 1
+    last_page = None
+    window_size = max_workers * 2
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        while True:
+            if banned_flag.is_set():
+                break
+                
+            # Check for consecutive 404s to determine last_page
+            # Scan from 1 upwards
+            detected_last_page = None
+            for i in range(1, next_submit_idx + 1):
+                # If we see two consecutive 404s, i-1 is the last page
+                with status_lock:
+                    is_404_i = (status.get(i) == '404')
+                    is_404_next = (status.get(i + 1) == '404')
+                if is_404_i and is_404_next:
+                    detected_last_page = i - 1
+                    break
+                    
+            if detected_last_page is not None:
+                last_page = detected_last_page
+                
+            # If last page is known, check if all pages up to last page are completed
+            if last_page is not None:
+                all_done = True
+                for i in range(1, last_page + 1):
+                    with status_lock:
+                        st = status.get(i)
+                    if st not in ['downloaded', 'failed']:
+                        all_done = False
+                        break
+                if all_done:
+                    break
+                    
+            # Calculate highest_finished_idx: the contiguous block of finished/failed/404 pages from 1.
+            contig = 0
+            while True:
+                with status_lock:
+                    has_it = (contig + 1) in status
+                if has_it:
+                    contig += 1
                 else:
-                    import time
-                    time.sleep(3) # Wait more before retrying
+                    break
+            highest_finished_idx = contig
+            
+            # Submit new tasks to fill up max_workers
+            while len(active_futures) < max_workers:
+                should_submit = False
+                if last_page is not None:
+                    if next_submit_idx <= last_page:
+                        should_submit = True
+                else:
+                    if next_submit_idx <= highest_finished_idx + window_size:
+                        should_submit = True
+                        
+                if should_submit:
+                    future = executor.submit(download_page, next_submit_idx)
+                    active_futures[future] = next_submit_idx
+                    next_submit_idx += 1
+                else:
+                    break
+                    
+            if not active_futures:
+                break
+                
+            # Wait for at least one future to complete
+            done, _ = concurrent.futures.wait(active_futures.keys(), return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                idx = active_futures.pop(future)
+                try:
+                    res = future.result()
+                    with status_lock:
+                        status[idx] = res
+                except Exception as e:
+                    logging.error(f"Future for page {idx} raised exception: {e}")
+                    with status_lock:
+                        status[idx] = 'failed'
+                        
+    if banned_flag.is_set() or any(status.get(i) == 'banned' for i in status):
+        return "BANNED"
         
-        if hit_404:
-            break
-        if banned:
-            return "BANNED"
-        if not success_download:
-            break
-            
-        current_idx += 1
-            
-    return downloaded_any
+    if last_page is None or last_page == 0:
+        logging.error("Could not determine the end of the chapter (no pages found).")
+        return False
+        
+    failed_pages = [i for i in range(1, last_page + 1) if status.get(i) == 'failed']
+    if failed_pages:
+        logging.warning(f"Chapter download incomplete. Failed pages: {failed_pages}")
+        return False
+        
+    # Mark this chapter as completely downloaded
+    with open(os.path.join(save_dir, ".complete"), "w") as f:
+        f.write("done")
+    logging.info(f"Finished processing {save_dir}. All pages downloaded successfully.")
+    return True
 
 def download_chapter(page, chapter_url, save_dir, progress_callback=None):
     first_image_url = None
@@ -142,22 +279,48 @@ def download_chapter(page, chapter_url, save_dir, progress_callback=None):
 
     page.on("response", handle_response)
     
+    # Abort unnecessary resources (stylesheets, fonts, media) and trackers to load faster
+    def route_filter(route):
+        resource_type = route.request.resource_type
+        url = route.request.url
+        if resource_type in ["stylesheet", "font", "media"]:
+            route.abort()
+        elif any(tracker in url for tracker in ["google-analytics", "doubleclick", "facebook", "analytics", "ads"]):
+            route.abort()
+        else:
+            route.continue_()
+            
+    try:
+        page.route("**/*", route_filter)
+    except Exception:
+        pass
+        
     logging.info(f"Navigating to {chapter_url}...")
     try:
-        page.goto(chapter_url, wait_until="networkidle")
-        page.wait_for_timeout(2000) # Wait to allow responses to trigger
+        # domcontentloaded is much faster than networkidle
+        page.goto(chapter_url, wait_until="domcontentloaded", timeout=20000)
+        
+        # Poll for first_image_url with timeout of 5 seconds (50 * 100ms)
+        for _ in range(50):
+            if first_image_url:
+                break
+            page.wait_for_timeout(100)
     except Exception as e:
         logging.error(f"Error loading page {chapter_url}: {e}")
         
-    # Always remove listener to prevent duplicate firings on subsequent navigations
-    page.remove_listener("response", handle_response)
+    # Always clean up routing and listeners
+    try:
+        page.remove_listener("response", handle_response)
+        page.unroute("**/*")
+    except Exception:
+        pass
     
     if "Just a moment" in page.title() or "Cloudflare" in page.title():
         logging.error("Cloudflare challenge detected. You are temporarily banned or blocked.")
         return "BANNED"
 
     if first_image_url:
-        logging.info(f"Starting sequential download to {save_dir}/ ...")
+        logging.info(f"Starting concurrent download to {save_dir}/ ...")
         success = download_sequential_images(first_image_url, save_dir, progress_callback)
         if success == "BANNED":
             return "BANNED"
@@ -191,19 +354,6 @@ def download_all_from_progress(progress_file):
     if not os.path.exists(base_dir):
         os.makedirs(base_dir)
         
-    # Download state file to keep track of completed indexes
-    downloader_state_file = f"downloader_state_{manga_slug}.json"
-    start_idx = 0
-    
-    if os.path.exists(downloader_state_file):
-        try:
-            with open(downloader_state_file, "r", encoding="utf-8") as f:
-                state_data = json.load(f)
-                start_idx = state_data.get("last_completed_idx", -1) + 1
-            logging.info(f"Resuming download from chapter index {start_idx} based on state file.")
-        except Exception as e:
-            logging.error(f"Failed to load downloader state file: {e}")
-    
     # Reverse the chapters list to download oldest first (chapter 1 -> chapter 1000)
     chapters.reverse() 
     total_chapters = len(chapters)
@@ -211,10 +361,11 @@ def download_all_from_progress(progress_file):
     
     with sync_playwright() as p:
         try:
+            # Reusing browser instance across all downloads
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
+            page = browser.new_page(user_agent=get_random_user_agent())
             
-            for idx in range(start_idx, total_chapters):
+            for idx in range(total_chapters):
                 chapter = chapters[idx]
                 ch_name = sanitize_filename(chapter.get("chapter_name", f"chapter_{idx}"))
                 ch_url = chapter.get("chapter_url")
@@ -226,21 +377,17 @@ def download_all_from_progress(progress_file):
                     
                 save_dir = os.path.join(base_dir, folder_name)
                 
-                logging.info(f"\n--- Processing {idx+1}/{total_chapters}: {folder_name} ---")
-                
                 # Check complete marker in case folder was manually managed
                 if os.path.exists(os.path.join(save_dir, ".complete")):
-                    logging.info(f"Chapter already fully downloaded. Skipping.")
-                else:
-                    success = download_chapter(page, ch_url, save_dir)
+                    logging.info(f"Chapter {idx+1}/{total_chapters} ({folder_name}) already fully downloaded. Skipping.")
+                    continue
+                    
+                logging.info(f"\n--- Processing {idx+1}/{total_chapters}: {folder_name} ---")
                 
-                # Save progress after each chapter loop completes
-                try:
-                    with open(downloader_state_file, 'w', encoding='utf-8') as f:
-                        json.dump({"last_completed_idx": idx}, f, indent=4)
-                    logging.info(f"Downloader progress saved to {downloader_state_file}")
-                except Exception as e:
-                    logging.error(f"Failed to save downloader state: {e}")
+                success = download_chapter(page, ch_url, save_dir)
+                if success == "BANNED":
+                    logging.error("Banned by Cloudflare. Stopping batch download.")
+                    break
                     
         except Exception as e:
             logging.error(f"A critical error occurred in the Playwright instance: {e}")

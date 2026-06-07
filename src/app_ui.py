@@ -6,7 +6,8 @@ import requests
 from io import BytesIO
 from PIL import Image
 from .api import get_metadata_app, get_chapters_page
-from .downloader_manager import download_single_chapter
+from .downloader import download_chapter, sanitize_filename
+import queue
 import re
 import os
 
@@ -28,6 +29,12 @@ class App(ctk.CTk):
             os.makedirs(self.save_path)
         self.chapters_data = []
         self.group_options = ["All Groups"]
+        
+        # Queue system for serializing downloads to reuse browser
+        self.download_queue = queue.Queue()
+        self.worker_thread = None
+        self.worker_lock = threading.Lock()
+        self.stop_worker = False
 
         # -- UI LAYOUT --
         self.grid_columnconfigure(1, weight=1)
@@ -281,42 +288,115 @@ class App(ctk.CTk):
         self.current_page += 1
         self.load_chapters()
 
-    def download_chapter(self, chap):
-        threading.Thread(target=self.download_chapter_thread, args=(chap,), daemon=True).start()
+    def start_worker_if_needed(self):
+        with self.worker_lock:
+            if self.worker_thread is None or not self.worker_thread.is_alive():
+                self.stop_worker = False
+                self.worker_thread = threading.Thread(target=self.queue_worker_loop, daemon=True)
+                self.worker_thread.start()
+
+    def queue_worker_loop(self):
+        from playwright.sync_api import sync_playwright
+        from .utils import get_random_user_agent
         
-    def download_chapter_thread(self, chap):
-        ch_name = chap.get("chapter_name", "Unknown")
-        ch_url = chap.get("chapter_url")
-        group = chap.get("group", "")
-        
-        self.after(0, lambda: self.status_label.configure(text=f"Downloading: {ch_name}"))
-        self.after(0, lambda: self.progress_bar.start())
-        
-        # Get slug
-        match = re.search(r'/title/([^/]+)', self.current_url)
-        slug = match.group(1) if match else "unknown"
-        
-        base_dir = os.path.join(self.save_path, slug)
-        
-        def progress_cb(img_idx):
-            self.after(0, lambda: self.status_label.configure(text=f"Downloading {ch_name}: Image {img_idx}"))
-            
-        success = download_single_chapter(ch_name, ch_url, group, base_dir, progress_cb)
-        
-        self.after(0, lambda: self.progress_bar.stop())
+        with sync_playwright() as p:
+            browser = None
+            page = None
+            try:
+                while not self.stop_worker:
+                    try:
+                        # Get a chapter task from the queue, wait up to 1 second
+                        chap_task = self.download_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        break
+                        
+                    ch_name = chap_task.get("chapter_name", "Unknown")
+                    ch_url = chap_task.get("chapter_url")
+                    group = chap_task.get("group", "")
+                    
+                    q_size = self.download_queue.qsize()
+                    status_text = f"Downloading: {ch_name}"
+                    if q_size > 0:
+                        status_text += f" ({q_size} in queue)"
+                        
+                    self.after(0, lambda s=status_text: self.status_label.configure(text=s))
+                    self.after(0, lambda: self.progress_bar.start())
+                    
+                    if browser is None:
+                        try:
+                            browser = p.chromium.launch(headless=True)
+                            page = browser.new_page(user_agent=get_random_user_agent())
+                        except Exception as e:
+                            print(f"Error launching browser: {e}")
+                            self.download_queue.task_done()
+                            continue
+                            
+                    # Target folder
+                    match = re.search(r'/title/([^/]+)', self.current_url)
+                    slug = match.group(1) if match else "unknown"
+                    base_dir = os.path.join(self.save_path, slug)
+                    
+                    ch_name_safe = sanitize_filename(ch_name)
+                    group_safe = sanitize_filename(group) if group else ""
+                    folder_name = ch_name_safe
+                    if group_safe:
+                        folder_name += f" [{group_safe}]"
+                    save_dir = os.path.join(base_dir, folder_name)
+                    
+                    def progress_cb(img_idx, name=ch_name, size=q_size):
+                        lbl_text = f"Downloading {name}: Image {img_idx}"
+                        if size > 0:
+                            lbl_text += f" ({size} in queue)"
+                        self.after(0, lambda t=lbl_text: self.status_label.configure(text=t))
+                        
+                    success = False
+                    if os.path.exists(os.path.join(save_dir, ".complete")):
+                        success = True
+                    else:
+                        try:
+                            success = download_chapter(page, ch_url, save_dir, progress_cb)
+                        except Exception as e:
+                            print(f"Error downloading chapter {ch_name}: {e}")
+                            success = False
+                            
+                    self.after(0, lambda: self.progress_bar.stop())
+                    self.after(0, lambda: self.status_label.configure(text="Idle"))
+                    
+                    if success == "BANNED":
+                        print(f"Banned during: {ch_name}")
+                        self.after(0, lambda: messagebox.showerror(
+                            "Access Denied", 
+                            "Cloudflare Challenge or IP Ban detected during download.\nPlease wait a few minutes or use a VPN."
+                        ))
+                        # Clear remaining queue on ban
+                        while not self.download_queue.empty():
+                            try:
+                                self.download_queue.get_nowait()
+                                self.download_queue.task_done()
+                            except queue.Empty:
+                                break
+                        break
+                    elif success:
+                        print(f"Downloaded: {ch_name}")
+                        chap_task["downloaded"] = True
+                        btn = getattr(self, "chapter_buttons", {}).get(ch_url)
+                        if btn:
+                            self.after(0, lambda b=btn: b.configure(text="Done", state="disabled"))
+                    else:
+                        print(f"Failed to download chapter: {ch_name}")
+                        
+                    self.download_queue.task_done()
+            finally:
+                if browser:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
         self.after(0, lambda: self.status_label.configure(text="Idle"))
-        
-        if success == "BANNED":
-            print(f"Banned during: {ch_name}")
-            self.after(0, lambda: messagebox.showerror("Access Denied", "Cloudflare Challenge or IP Ban detected during download.\nPlease wait a few minutes or use a VPN."))
-        elif success:
-            print(f"Downloaded: {ch_name}")
-            chap["downloaded"] = True
-            btn = getattr(self, "chapter_buttons", {}).get(ch_url)
-            if btn:
-                self.after(0, lambda b=btn: b.configure(text="Done", state="disabled"))
-        else:
-            print(f"Failed: {ch_name}")
+
+    def download_chapter(self, chap):
+        self.download_queue.put(chap)
+        self.start_worker_if_needed()
 
     def download_all_on_page(self):
         selected_group = self.group_combo.get()
@@ -337,6 +417,7 @@ class App(ctk.CTk):
             return
             
         page_num = 1
+        self.after(0, lambda: self.status_label.configure(text="Fetching chapter list..."))
         while True:
             chapters = get_chapters_page(url, page_num)
             if not chapters:
@@ -348,6 +429,8 @@ class App(ctk.CTk):
             for chap in chapters:
                 if selected_group != "All Groups" and chap.get("group", "") != selected_group:
                     continue
-                self.download_chapter_thread(chap)
+                self.download_queue.put(chap)
             page_num += 1
+            
+        self.start_worker_if_needed()
         print("Finished scheduling whole manga download")

@@ -44,13 +44,28 @@ def get_chapters(base_url):
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             
+            # Route filter to block heavy resources/trackers
+            def route_filter(route):
+                resource_type = route.request.resource_type
+                url_str = route.request.url
+                if resource_type in ["stylesheet", "font", "media", "image"]:
+                    route.abort()
+                elif any(tracker in url_str for tracker in ["google-analytics", "doubleclick", "facebook", "analytics", "ads"]):
+                    route.abort()
+                else:
+                    route.continue_()
+            try:
+                page.route("**/*", route_filter)
+            except Exception:
+                pass
+            
             while True:
                 separator = "&" if "?" in base_url else "?"
                 url = f"{base_url}{separator}page={page_num}"
                 logging.info(f"Fetching {url}")
                 
                 try:
-                    page.goto(url, wait_until='networkidle')
+                    page.goto(url, wait_until='domcontentloaded', timeout=15000)
                     # Wait for chapters to load, timeout after 5s if none exist
                     page.wait_for_selector('.mchap-item', timeout=5000)
                 except Exception as e:
