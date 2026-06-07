@@ -77,7 +77,7 @@ class App(ctk.CTk):
         self.download_all_page_btn = ctk.CTkButton(self.controls_frame, text="Download All on Page", command=self.download_all_on_page)
         self.download_all_page_btn.grid(row=1, column=0, padx=10, pady=(5, 10), sticky="ew")
 
-        self.group_combo = ctk.CTkOptionMenu(self.controls_frame, values=self.group_options)
+        self.group_combo = ctk.CTkOptionMenu(self.controls_frame, values=self.group_options, command=self.on_group_changed)
         self.group_combo.grid(row=1, column=1, padx=10, pady=(5, 10), sticky="ew")
 
         self.download_all_btn = ctk.CTkButton(self.controls_frame, text="Download Whole Manga", command=self.download_whole_manga)
@@ -224,24 +224,52 @@ class App(ctk.CTk):
             if new_groups_found:
                 self.group_combo.configure(values=self.group_options)
             
-            for i, chap in enumerate(chapters):
-                frame = ctk.CTkFrame(self.chapters_frame)
-                frame.grid(row=i, column=0, padx=5, pady=5, sticky="ew")
-                frame.grid_columnconfigure(0, weight=1)
-                
-                name_text = chap.get("chapter_name", "")
-                if chap.get("group"):
-                    name_text += f" [{chap['group']}]"
-                    
-                lbl = ctk.CTkLabel(frame, text=name_text, anchor="w")
-                lbl.grid(row=0, column=0, padx=10, pady=5, sticky="w")
-                
-                btn = ctk.CTkButton(frame, text="Download", width=80, 
-                                    command=lambda c=chap: self.download_chapter(c))
-                btn.grid(row=0, column=1, padx=10, pady=5)
+            self.render_chapters_list()
         else:
             self.next_btn.configure(state="disabled")
             lbl = ctk.CTkLabel(self.chapters_frame, text="No chapters found on this page.")
+            lbl.grid(row=0, column=0, pady=20)
+
+    def on_group_changed(self, choice):
+        self.render_chapters_list()
+
+    def render_chapters_list(self):
+        for widget in self.chapters_frame.winfo_children():
+            widget.destroy()
+            
+        selected_group = self.group_combo.get()
+        displayed_count = 0
+        
+        self.chapter_buttons = getattr(self, "chapter_buttons", {})
+        
+        for i, chap in enumerate(self.chapters_data):
+            if selected_group != "All Groups" and chap.get("group", "") != selected_group:
+                continue
+                
+            displayed_count += 1
+            frame = ctk.CTkFrame(self.chapters_frame)
+            frame.grid(row=i, column=0, padx=5, pady=5, sticky="ew")
+            frame.grid_columnconfigure(0, weight=1)
+            
+            name_text = chap.get("chapter_name", "")
+            if chap.get("group"):
+                name_text += f" [{chap['group']}]"
+                
+            lbl = ctk.CTkLabel(frame, text=name_text, anchor="w")
+            lbl.grid(row=0, column=0, padx=10, pady=5, sticky="w")
+            
+            btn = ctk.CTkButton(frame, text="Download", width=80, 
+                                command=lambda c=chap: self.download_chapter(c))
+            btn.grid(row=0, column=1, padx=10, pady=5)
+            
+            # Store button ref to change text to "Done" later
+            self.chapter_buttons[chap.get("chapter_url")] = btn
+            
+            if chap.get("downloaded", False):
+                btn.configure(text="Done", state="disabled")
+                
+        if displayed_count == 0 and self.chapters_data:
+            lbl = ctk.CTkLabel(self.chapters_frame, text="No chapters match the selected group.")
             lbl.grid(row=0, column=0, pady=20)
 
     def prev_page(self):
@@ -270,7 +298,10 @@ class App(ctk.CTk):
         
         base_dir = os.path.join(self.save_path, slug)
         
-        success = download_single_chapter(ch_name, ch_url, group, base_dir)
+        def progress_cb(img_idx):
+            self.after(0, lambda: self.status_label.configure(text=f"Downloading {ch_name}: Image {img_idx}"))
+            
+        success = download_single_chapter(ch_name, ch_url, group, base_dir, progress_cb)
         
         self.after(0, lambda: self.progress_bar.stop())
         self.after(0, lambda: self.status_label.configure(text="Idle"))
@@ -280,6 +311,10 @@ class App(ctk.CTk):
             self.after(0, lambda: messagebox.showerror("Access Denied", "Cloudflare Challenge or IP Ban detected during download.\nPlease wait a few minutes or use a VPN."))
         elif success:
             print(f"Downloaded: {ch_name}")
+            chap["downloaded"] = True
+            btn = getattr(self, "chapter_buttons", {}).get(ch_url)
+            if btn:
+                self.after(0, lambda b=btn: b.configure(text="Done", state="disabled"))
         else:
             print(f"Failed: {ch_name}")
 

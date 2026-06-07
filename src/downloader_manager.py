@@ -4,7 +4,7 @@ import sys
 import src.downloader as downloader
 from playwright.sync_api import sync_playwright
 
-def download_single_chapter(ch_name, ch_url, group, base_save_path):
+def download_single_chapter(ch_name, ch_url, group, base_save_path, progress_callback=None):
     try:
         ch_name_safe = downloader.sanitize_filename(ch_name)
         group_safe = downloader.sanitize_filename(group) if group else ""
@@ -25,7 +25,7 @@ def download_single_chapter(ch_name, ch_url, group, base_save_path):
             browser = p.chromium.launch(headless=True)
             from .utils import get_random_user_agent
             page = browser.new_page(user_agent=get_random_user_agent())
-            success = downloader.download_chapter(page, ch_url, save_dir)
+            success = downloader.download_chapter(page, ch_url, save_dir, progress_callback)
             browser.close()
             
         return success

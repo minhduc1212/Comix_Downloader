@@ -42,4 +42,4 @@ custom tkinter
             show what chapter done
 
 # fix
-    Error downloading https://j24n.wowpic1.store/i4/bEqPbYfoMT0Gm03lbmafoBJcyrkdVvw/11.webp: ('Connection broken: IncompleteRead(430724 bytes read, 115324 more expected)', IncompleteRead(430724 bytes read, 115324 more expected)) -> not done -> wait more for loading -> just end if the status is 404
+    Error downloading https://j24n.wowpic1.store/i4/bEqPbYfoMT0Gm03lbmafoBJcyrkdVvw/11.webp: ('Connection broken: IncompleteRead(430724 bytes read, 115324 more expected)', IncompleteRead(430724 bytes read, 115324 more expected)) -> not done -> wait more for loading -> just end if the status is 404 -> the other status should be wait and retry at least 3 times

@@ -20,7 +20,7 @@ def sanitize_filename(name):
     # Remove invalid characters for Windows/Linux folder names
     return re.sub(r'[<>:"/\\|?*]', '', name).strip()
 
-def download_sequential_images(first_image_url, save_dir):
+def download_sequential_images(first_image_url, save_dir, progress_callback=None):
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
         
@@ -55,40 +55,68 @@ def download_sequential_images(first_image_url, save_dir):
             
         logging.info(f"Downloading image {current_idx}: {url}")
         
-        # Random delay and random User-Agent before request
-        random_delay(0.5, 1.5)
-        headers = {
-            "User-Agent": get_random_user_agent(),
-            "Referer": "https://comix.to/"
-        }
-        
-        try:
-            response = requests.get(url, headers=headers)
-            if response.status_code == 404:
-                logging.info(f"Encountered 404. Assuming chapter download is complete.")
-                # Mark this chapter as completely downloaded
-                with open(os.path.join(save_dir, ".complete"), "w") as f:
-                    f.write("done")
+        max_retries = 5
+        success_download = False
+        hit_404 = False
+        banned = False
+
+        for attempt in range(max_retries):
+            # Random delay and random User-Agent before request
+            random_delay(0.5, 1.5)
+            headers = {
+                "User-Agent": get_random_user_agent(),
+                "Referer": "https://comix.to/"
+            }
+            
+            try:
+                # Use stream=True and iter_content to handle IncompleteRead more gracefully
+                response = requests.get(url, headers=headers, timeout=30, stream=True)
+                if response.status_code == 404:
+                    logging.info(f"Encountered 404. Assuming chapter download is complete.")
+                    # Mark this chapter as completely downloaded
+                    with open(os.path.join(save_dir, ".complete"), "w") as f:
+                        f.write("done")
+                    hit_404 = True
+                    break
+                
+                if response.status_code in [403, 429]:
+                    logging.error(f"Encountered {response.status_code}. Likely banned or rate-limited.")
+                    banned = True
+                    break
+                    
+                response.raise_for_status()
+                
+                # Write in chunks
+                with open(file_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                    
+                downloaded_any = True
+                success_download = True
+                if progress_callback:
+                    progress_callback(current_idx)
                 break
-            
-            if response.status_code in [403, 429]:
-                logging.error(f"Encountered {response.status_code}. Likely banned or rate-limited.")
-                return "BANNED"
-                
-            response.raise_for_status()
-            
-            with open(file_path, "wb") as f:
-                f.write(response.content)
-                
-            downloaded_any = True
-            current_idx += 1
-        except Exception as e:
-            logging.error(f"Error downloading {url}: {e}")
+            except Exception as e:
+                logging.warning(f"Error downloading {url} (Attempt {attempt+1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    logging.error(f"Failed to download {url} after {max_retries} attempts.")
+                else:
+                    import time
+                    time.sleep(3) # Wait more before retrying
+        
+        if hit_404:
             break
+        if banned:
+            return "BANNED"
+        if not success_download:
+            break
+            
+        current_idx += 1
             
     return downloaded_any
 
-def download_chapter(page, chapter_url, save_dir):
+def download_chapter(page, chapter_url, save_dir, progress_callback=None):
     first_image_url = None
     
     def handle_response(response):
@@ -130,7 +158,7 @@ def download_chapter(page, chapter_url, save_dir):
 
     if first_image_url:
         logging.info(f"Starting sequential download to {save_dir}/ ...")
-        success = download_sequential_images(first_image_url, save_dir)
+        success = download_sequential_images(first_image_url, save_dir, progress_callback)
         if success == "BANNED":
             return "BANNED"
         if success:
