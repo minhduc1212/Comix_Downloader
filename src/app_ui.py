@@ -1,0 +1,318 @@
+import customtkinter as ctk
+import tkinter.messagebox as messagebox
+from tkinter import filedialog
+import threading
+import requests
+from io import BytesIO
+from PIL import Image
+from .api import get_metadata_app, get_chapters_page
+from .downloader_manager import download_single_chapter
+import re
+import os
+
+ctk.set_appearance_mode("System")
+ctk.set_default_color_theme("blue")
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("Comix Downloader")
+        self.geometry("900x700")
+        self.minsize(800, 600)
+
+        self.current_url = ""
+        self.current_page = 1
+        self.save_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+        if not os.path.exists(self.save_path):
+            os.makedirs(self.save_path)
+        self.chapters_data = []
+        self.group_options = ["All Groups"]
+
+        # -- UI LAYOUT --
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        # 1. Top Frame: URL input
+        self.top_frame = ctk.CTkFrame(self)
+        self.top_frame.grid(row=0, column=0, columnspan=2, padx=10, pady=(10, 5), sticky="ew")
+        self.top_frame.grid_columnconfigure(1, weight=1)
+
+        self.url_label = ctk.CTkLabel(self.top_frame, text="Manga URL:")
+        self.url_label.grid(row=0, column=0, padx=10, pady=10)
+
+        self.url_entry = ctk.CTkEntry(self.top_frame, placeholder_text="https://comix.to/title/...")
+        self.url_entry.grid(row=0, column=1, padx=(0, 10), pady=10, sticky="ew")
+
+        self.get_btn = ctk.CTkButton(self.top_frame, text="Get Info", command=self.on_get_clicked)
+        self.get_btn.grid(row=0, column=2, padx=10, pady=10)
+
+        # 2. Left Frame: Metadata (Cover, Title, Desc)
+        self.left_frame = ctk.CTkFrame(self, width=250)
+        self.left_frame.grid(row=1, column=0, rowspan=2, padx=(10, 5), pady=5, sticky="nsew")
+
+        self.cover_label = ctk.CTkLabel(self.left_frame, text="Cover Image", width=200, height=300, bg_color="gray")
+        self.cover_label.pack(padx=10, pady=10)
+
+        self.title_label = ctk.CTkLabel(self.left_frame, text="Title", font=ctk.CTkFont(size=16, weight="bold"), wraplength=220)
+        self.title_label.pack(padx=10, pady=(0, 5))
+
+        self.desc_textbox = ctk.CTkTextbox(self.left_frame, width=220, height=200, wrap="word")
+        self.desc_textbox.pack(padx=10, pady=5, fill="both", expand=True)
+        self.desc_textbox.insert("0.0", "Description will appear here.")
+        self.desc_textbox.configure(state="disabled")
+
+        # 3. Middle Frame: Controls for downloading & pagination
+        self.controls_frame = ctk.CTkFrame(self)
+        self.controls_frame.grid(row=1, column=1, padx=(5, 10), pady=5, sticky="ew")
+        self.controls_frame.grid_columnconfigure(0, weight=1)
+        self.controls_frame.grid_columnconfigure(1, weight=1)
+
+        self.path_label = ctk.CTkLabel(self.controls_frame, text=f"Save Path: {self.save_path}", anchor="w")
+        self.path_label.grid(row=0, column=0, padx=10, pady=(10, 5), sticky="ew")
+
+        self.change_path_btn = ctk.CTkButton(self.controls_frame, text="Change Path", command=self.change_save_path, width=120)
+        self.change_path_btn.grid(row=0, column=1, padx=10, pady=(10, 5), sticky="e")
+
+        self.download_all_page_btn = ctk.CTkButton(self.controls_frame, text="Download All on Page", command=self.download_all_on_page)
+        self.download_all_page_btn.grid(row=1, column=0, padx=10, pady=(5, 10), sticky="ew")
+
+        self.group_combo = ctk.CTkOptionMenu(self.controls_frame, values=self.group_options)
+        self.group_combo.grid(row=1, column=1, padx=10, pady=(5, 10), sticky="ew")
+
+        self.download_all_btn = ctk.CTkButton(self.controls_frame, text="Download Whole Manga", command=self.download_whole_manga)
+        self.download_all_btn.grid(row=1, column=2, padx=10, pady=(5, 10), sticky="ew")
+
+        # 4. Right Frame: Chapters list
+        self.chapters_frame = ctk.CTkScrollableFrame(self, label_text="Chapters")
+        self.chapters_frame.grid(row=2, column=1, padx=(5, 10), pady=5, sticky="nsew")
+        self.chapters_frame.grid_columnconfigure(0, weight=1)
+
+        # 5. Bottom Frame: Pagination
+        self.pagination_frame = ctk.CTkFrame(self)
+        self.pagination_frame.grid(row=3, column=1, padx=(5, 10), pady=(5, 10), sticky="ew")
+        
+        self.prev_btn = ctk.CTkButton(self.pagination_frame, text="<- Prev", width=60, command=self.prev_page, state="disabled")
+        self.prev_btn.pack(side="left", padx=10, pady=10)
+
+        self.page_label = ctk.CTkLabel(self.pagination_frame, text="Page 1")
+        self.page_label.pack(side="left", expand=True, pady=10)
+
+        self.next_btn = ctk.CTkButton(self.pagination_frame, text="Next ->", width=60, command=self.next_page, state="disabled")
+        self.next_btn.pack(side="right", padx=10, pady=10)
+
+        # 6. Status Frame
+        self.status_frame = ctk.CTkFrame(self)
+        self.status_frame.grid(row=4, column=1, padx=(5, 10), pady=(0, 10), sticky="ew")
+        
+        self.status_label = ctk.CTkLabel(self.status_frame, text="Idle", text_color="gray")
+        self.status_label.pack(side="left", padx=10, pady=5)
+        
+        self.progress_bar = ctk.CTkProgressBar(self.status_frame, mode="indeterminate")
+        self.progress_bar.pack(side="right", fill="x", expand=True, padx=10, pady=5)
+        self.progress_bar.set(0)
+
+    def change_save_path(self):
+        directory = filedialog.askdirectory(initialdir=self.save_path)
+        if directory:
+            self.save_path = directory
+            self.path_label.configure(text=f"Save Path: {self.save_path}")
+
+    def on_get_clicked(self):
+        url = self.url_entry.get().strip()
+        if not url:
+            messagebox.showwarning("Warning", "Please enter a URL")
+            return
+            
+        self.current_url = url
+        self.current_page = 1
+        
+        # Reset UI
+        self.title_label.configure(text="Loading...")
+        self.desc_textbox.configure(state="normal")
+        self.desc_textbox.delete("0.0", "end")
+        self.desc_textbox.insert("0.0", "Loading...")
+        self.desc_textbox.configure(state="disabled")
+        self.get_btn.configure(state="disabled")
+        
+        threading.Thread(target=self.fetch_metadata_thread, args=(url,), daemon=True).start()
+        self.load_chapters()
+
+    def fetch_metadata_thread(self, url):
+        metadata = get_metadata_app(url)
+        self.after(0, self.update_metadata_ui, metadata)
+
+    def update_metadata_ui(self, metadata):
+        self.get_btn.configure(state="normal")
+        
+        if "error" in metadata:
+            if metadata["error"] == "BANNED":
+                messagebox.showerror("Access Denied", "Cloudflare Challenge or IP Ban detected from the website.\n\nPlease wait a few minutes, clear your IP limit, or try using a VPN.")
+            else:
+                messagebox.showerror("Error", metadata["error"])
+            return
+            
+        title = metadata.get("title", "Unknown")
+        desc = metadata.get("desc", "No description.")
+        img_url = metadata.get("img")
+        
+        self.title_label.configure(text=title)
+        
+        self.desc_textbox.configure(state="normal")
+        self.desc_textbox.delete("0.0", "end")
+        self.desc_textbox.insert("0.0", desc)
+        self.desc_textbox.configure(state="disabled")
+        
+        if img_url:
+            threading.Thread(target=self.load_image_thread, args=(img_url,), daemon=True).start()
+            
+    def load_image_thread(self, img_url):
+        try:
+            response = requests.get(img_url)
+            if response.status_code == 200:
+                img_data = response.content
+                image = Image.open(BytesIO(img_data))
+                ctk_image = ctk.CTkImage(light_image=image, dark_image=image, size=(200, 300))
+                self.after(0, lambda: self.cover_label.configure(image=ctk_image, text=""))
+        except Exception as e:
+            print(f"Error loading image: {e}")
+
+    def load_chapters(self):
+        for widget in self.chapters_frame.winfo_children():
+            widget.destroy()
+            
+        loading_label = ctk.CTkLabel(self.chapters_frame, text="Loading chapters...")
+        loading_label.grid(row=0, column=0, pady=20)
+        
+        self.prev_btn.configure(state="disabled")
+        self.next_btn.configure(state="disabled")
+        
+        threading.Thread(target=self.fetch_chapters_thread, args=(self.current_url, self.current_page), daemon=True).start()
+        
+    def fetch_chapters_thread(self, url, page_num):
+        chapters = get_chapters_page(url, page_num)
+        self.after(0, self.update_chapters_ui, chapters)
+        
+    def update_chapters_ui(self, chapters):
+        self.chapters_data = chapters
+        
+        for widget in self.chapters_frame.winfo_children():
+            widget.destroy()
+            
+        if chapters and len(chapters) == 1 and chapters[0].get("error") == "BANNED":
+            messagebox.showerror("Access Denied", "Cloudflare Challenge or IP Ban detected while fetching chapters.\nPlease wait a few minutes or use a VPN.")
+            self.page_label.configure(text="Error")
+            return
+            
+        self.page_label.configure(text=f"Page {self.current_page}")
+        
+        if self.current_page > 1:
+            self.prev_btn.configure(state="normal")
+        else:
+            self.prev_btn.configure(state="disabled")
+            
+        if chapters:
+            self.next_btn.configure(state="normal")
+            
+            new_groups_found = False
+            for chap in chapters:
+                g = chap.get("group", "")
+                if g and g not in self.group_options:
+                    self.group_options.append(g)
+                    new_groups_found = True
+                    
+            if new_groups_found:
+                self.group_combo.configure(values=self.group_options)
+            
+            for i, chap in enumerate(chapters):
+                frame = ctk.CTkFrame(self.chapters_frame)
+                frame.grid(row=i, column=0, padx=5, pady=5, sticky="ew")
+                frame.grid_columnconfigure(0, weight=1)
+                
+                name_text = chap.get("chapter_name", "")
+                if chap.get("group"):
+                    name_text += f" [{chap['group']}]"
+                    
+                lbl = ctk.CTkLabel(frame, text=name_text, anchor="w")
+                lbl.grid(row=0, column=0, padx=10, pady=5, sticky="w")
+                
+                btn = ctk.CTkButton(frame, text="Download", width=80, 
+                                    command=lambda c=chap: self.download_chapter(c))
+                btn.grid(row=0, column=1, padx=10, pady=5)
+        else:
+            self.next_btn.configure(state="disabled")
+            lbl = ctk.CTkLabel(self.chapters_frame, text="No chapters found on this page.")
+            lbl.grid(row=0, column=0, pady=20)
+
+    def prev_page(self):
+        if self.current_page > 1:
+            self.current_page -= 1
+            self.load_chapters()
+
+    def next_page(self):
+        self.current_page += 1
+        self.load_chapters()
+
+    def download_chapter(self, chap):
+        threading.Thread(target=self.download_chapter_thread, args=(chap,), daemon=True).start()
+        
+    def download_chapter_thread(self, chap):
+        ch_name = chap.get("chapter_name", "Unknown")
+        ch_url = chap.get("chapter_url")
+        group = chap.get("group", "")
+        
+        self.after(0, lambda: self.status_label.configure(text=f"Downloading: {ch_name}"))
+        self.after(0, lambda: self.progress_bar.start())
+        
+        # Get slug
+        match = re.search(r'/title/([^/]+)', self.current_url)
+        slug = match.group(1) if match else "unknown"
+        
+        base_dir = os.path.join(self.save_path, slug)
+        
+        success = download_single_chapter(ch_name, ch_url, group, base_dir)
+        
+        self.after(0, lambda: self.progress_bar.stop())
+        self.after(0, lambda: self.status_label.configure(text="Idle"))
+        
+        if success == "BANNED":
+            print(f"Banned during: {ch_name}")
+            self.after(0, lambda: messagebox.showerror("Access Denied", "Cloudflare Challenge or IP Ban detected during download.\nPlease wait a few minutes or use a VPN."))
+        elif success:
+            print(f"Downloaded: {ch_name}")
+        else:
+            print(f"Failed: {ch_name}")
+
+    def download_all_on_page(self):
+        selected_group = self.group_combo.get()
+        for chap in self.chapters_data:
+            if chap.get("error") == "BANNED":
+                continue
+            if selected_group != "All Groups" and chap.get("group", "") != selected_group:
+                continue
+            self.download_chapter(chap)
+
+    def download_whole_manga(self):
+        selected_group = self.group_combo.get()
+        threading.Thread(target=self.download_whole_manga_thread, args=(selected_group,), daemon=True).start()
+
+    def download_whole_manga_thread(self, selected_group):
+        url = self.current_url
+        if not url:
+            return
+            
+        page_num = 1
+        while True:
+            chapters = get_chapters_page(url, page_num)
+            if not chapters:
+                break
+            if len(chapters) == 1 and chapters[0].get("error") == "BANNED":
+                print("Banned while paginating chapters.")
+                self.after(0, lambda: messagebox.showerror("Access Denied", "Cloudflare Challenge or IP Ban detected.\nDownload stopped."))
+                break
+            for chap in chapters:
+                if selected_group != "All Groups" and chap.get("group", "") != selected_group:
+                    continue
+                self.download_chapter_thread(chap)
+            page_num += 1
+        print("Finished scheduling whole manga download")

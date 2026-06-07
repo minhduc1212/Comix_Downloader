@@ -4,6 +4,7 @@ import json
 import logging
 import requests
 from playwright.sync_api import sync_playwright
+from .utils import get_random_user_agent, random_delay
 
 # Configure logging
 logging.basicConfig(
@@ -36,11 +37,6 @@ def download_sequential_images(first_image_url, save_dir):
     
     num_length = len(num_str)
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://comix.to/"
-    }
-
     current_idx = 1
     downloaded_any = False
     
@@ -59,6 +55,13 @@ def download_sequential_images(first_image_url, save_dir):
             
         logging.info(f"Downloading image {current_idx}: {url}")
         
+        # Random delay and random User-Agent before request
+        random_delay(0.5, 1.5)
+        headers = {
+            "User-Agent": get_random_user_agent(),
+            "Referer": "https://comix.to/"
+        }
+        
         try:
             response = requests.get(url, headers=headers)
             if response.status_code == 404:
@@ -67,6 +70,11 @@ def download_sequential_images(first_image_url, save_dir):
                 with open(os.path.join(save_dir, ".complete"), "w") as f:
                     f.write("done")
                 break
+            
+            if response.status_code in [403, 429]:
+                logging.error(f"Encountered {response.status_code}. Likely banned or rate-limited.")
+                return "BANNED"
+                
             response.raise_for_status()
             
             with open(file_path, "wb") as f:
@@ -116,9 +124,15 @@ def download_chapter(page, chapter_url, save_dir):
     # Always remove listener to prevent duplicate firings on subsequent navigations
     page.remove_listener("response", handle_response)
     
+    if "Just a moment" in page.title() or "Cloudflare" in page.title():
+        logging.error("Cloudflare challenge detected. You are temporarily banned or blocked.")
+        return "BANNED"
+
     if first_image_url:
         logging.info(f"Starting sequential download to {save_dir}/ ...")
         success = download_sequential_images(first_image_url, save_dir)
+        if success == "BANNED":
+            return "BANNED"
         if success:
             logging.info(f"Finished processing {save_dir}.")
             return True
